@@ -25,6 +25,8 @@ Environment:
   PORT                        set by Railway
 """
 
+import base64
+import json
 import logging
 import os
 import queue
@@ -64,8 +66,36 @@ def model():
     return _model
 
 
+def key_role(key: str) -> str:
+    """Which role a Supabase key acts as, read from the key itself (no secret is printed)."""
+    if key.startswith("sb_secret_"):
+        return "service_role"
+    if key.startswith("sb_publishable_"):
+        return "anon"
+    try:
+        payload = key.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role", "unknown")
+    except (IndexError, ValueError):
+        return "unknown"
+
+
 def headers() -> dict[str, str]:
+    # A new-format secret key is not a JWT: it goes in `apikey` only, and the
+    # gateway mints the service_role token itself.
+    if SERVICE_KEY.startswith("sb_"):
+        return {"apikey": SERVICE_KEY}
     return {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
+
+
+def checked(response: httpx.Response) -> httpx.Response:
+    """raise_for_status, but say what Supabase said -- a bare 403 hides the reason."""
+    if response.is_error:
+        raise RuntimeError(
+            f"{response.request.method} {response.request.url.path} -> "
+            f"{response.status_code}: {response.text[:500]}"
+        )
+    return response
 
 
 def align(audio_file: str, transcript: str) -> list[float] | None:
@@ -84,12 +114,19 @@ def align(audio_file: str, transcript: str) -> list[float] | None:
 
 
 def run(table: str, row_id: str) -> str:
+    role = key_role(SERVICE_KEY)
+    if role != "service_role":
+        raise RuntimeError(
+            f"SUPABASE_SERVICE_ROLE_KEY is a '{role}' key, not the service_role key. "
+            "Copy service_role (or a secret key, sb_secret_...) from Supabase -> "
+            "Project Settings -> API Keys."
+        )
     with httpx.Client(timeout=600) as http:
-        rows = http.get(
+        rows = checked(http.get(
             f"{SUPABASE_URL}/rest/v1/{table}",
             params={"id": f"eq.{row_id}", "select": "id,audio_path,transcript"},
             headers=headers(),
-        ).raise_for_status().json()
+        )).json()
         if not rows:
             return "no such row"
         row = rows[0]
@@ -98,9 +135,9 @@ def run(table: str, row_id: str) -> str:
             return "no audio or no transcript"
 
         path = urllib.parse.quote(row["audio_path"])
-        audio = http.get(
+        audio = checked(http.get(
             f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{path}", headers=headers()
-        ).raise_for_status()
+        ))
 
         suffix = Path(row["audio_path"]).suffix or ".mp3"
         with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
@@ -110,12 +147,12 @@ def run(table: str, row_id: str) -> str:
         if times is None:
             return "transcript and recording do not line up; nothing written"
 
-        http.patch(
+        checked(http.patch(
             f"{SUPABASE_URL}/rest/v1/{table}",
             params={"id": f"eq.{row_id}"},
             json={"transcript_words": times},
             headers={**headers(), "Prefer": "return=minimal"},
-        ).raise_for_status()
+        ))
         return f"timed {len(times)} words"
 
 
